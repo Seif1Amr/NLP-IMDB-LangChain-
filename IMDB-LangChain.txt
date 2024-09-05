@@ -1,0 +1,184 @@
+section 1
+!pip install pandas==2.0.1 
+!pip install openai==0.27.5
+!pip install pinecone-client==2.2.1
+!pip install tqdm==4.65.0
+!pip install sentence-transformers==2.2.2
+!pip install scikit-learn==1.2.2
+!pip install pinecone-client
+!pip install langchain==0.0.137
+section 2 
+import os
+import json
+import gzip
+import pandas as pd
+from urllib.request import urlopen
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+section 3
+from google.colab import drive 
+drive.mount('/content/gdrive')
+df = pd.read_csv('/content/gdrive/MyDrive/Colab Notebooks/IMDB/IMDB-Dataset.csv')
+section 4 
+# Rename the columns to match the code
+df = df.rename(columns={'review': 'full_review', 'sentiment': 'label'})
+
+# Truncate the review text
+max_text_length = 400
+def truncate_review(text):
+    return text[:max_text_length]
+
+df['truncated'] = df['full_review'].apply(truncate_review)
+section 5
+# Prepare training and test sets for training Random Forest Regressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error
+
+X_train, X_test, y_train, y_test = train_test_split(
+    list(df['truncated'].values),
+    df['label'],
+    test_size=0.2,
+    random_state=1
+)
+section 6
+from sklearn.preprocessing import LabelEncoder
+# Define the features and target variables
+X = df['truncated']  # Features
+y = df['label']  # Target
+
+# Map labels to numerical values
+label_mapping = {
+    'negative': -1,
+    'neutral': 0,
+    'positive': 1
+}
+
+# Convert labels to numerical values
+y = y.map(label_mapping)
+
+# Prepare training and test sets for training Random Forest Regressor
+X_train, X_test, y_train, y_test = train_test_split(
+    X,
+    y,
+    test_size=0.2,
+    random_state=1
+)
+section 7
+import re
+
+def clean_text(text):
+    # Remove <br> tags
+    cleaned_text = re.sub('<br\s*/>', ' ', text)
+    return cleaned_text
+
+# Apply the clean_text function to the text data
+X_train_cleaned = X_train.apply(clean_text)
+X_test_cleaned = X_test.apply(clean_text)
+section 8
+from langchain.embeddings import HuggingFaceEmbeddings
+import numpy as np
+
+embedding_model = HuggingFaceEmbeddings()
+
+# Apply the embedding function to the text data
+X_train_vectors = np.array([embedding_model.embed_query(text) for text in X_train_cleaned])
+X_test_vectors = np.array([embedding_model.embed_query(text) for text in X_test_cleaned])
+section 9
+# Train the Random Forest Regressor model
+from sklearn.ensemble import RandomForestRegressor
+
+model = RandomForestRegressor(n_estimators=150)
+model.fit(X_train_vectors, y_train)
+y_pred = model.predict(X_test_vectors)
+section 10
+# Calculate mean absolute error
+mae = mean_absolute_error(y_test, y_pred)
+print("Mean Absolute Error:", mae)
+section 11
+df['embedding_model'] = df.apply(lambda row: embedding_model.embed_query(row['truncated']), axis=1)
+section 12
+# Import Pinecone client
+
+import pinecone
+from langchain.vectorstores import Pinecone
+
+# Initialize Pinecone
+pinecone.init(
+    api_key='fb815a1e-a8b1-4df0-ba00-8c0b07162284',  
+    environment='us-west4-gcp-free'
+)
+
+texts=df['truncated'].tolist()
+
+text2 = str(texts) 
+
+vstore = Pinecone.from_texts(text2, embedding_model, index_name ='indextest')
+section 13
+# Import RetrievalQA and ChatOpenAPI and define review_chain to access the review data
+from langchain.chains import RetrievalQA
+from langchain.chat_models import ChatOpenAI
+
+chat = ChatOpenAI(model_name="gpt-4", temperature=0.0, openai_api_key = "sk-...............................")
+
+text2 = str(texts) 
+
+vstore = Pinecone.from_texts(text2, embedding_model, index_name ='index2')
+review_chain = RetrievalQA.from_chain_type(llm=chat, chain_type="stuff", retriever=vstore.as_retriever())
+section 14
+# Define the task for GPT-4 and run the chain
+q = """
+What is the overall impression of these reviews? Give the most prevalent examples.
+"""
+result = review_chain.run(q)
+print(result)
+section 15
+# Rename columns in the DataFrame and create metadata field for upserts with Pinecone's Python client directly
+df = df.rename(columns={'truncated': 'values', 'reviewerID': 'id'})
+df['metadata'] = df.apply(lambda row: dict(sentiment=row['label']), axis=1)
+section 16
+# Create two copies of data, one for upserts and one for extracting review text from ids returned from the filtered similarity search
+data = df[['metadata', 'values', 'id']].to_dict(orient='records')
+data_local = df[['metadata', 'values', 'full_review', 'id']].to_dict(orient='records')
+section 17
+# Create the Pinecone index
+index_name = 'filtered'
+pinecone.create_index(index_name, metric='euclidean', dimension=768)
+index = pinecone.Index(index_name)
+section 18
+# Upload the data in batches of 50
+from tqdm import tqdm
+
+for i in tqdm(range(0, len(data), 50)):
+    j = i + 50
+    if j > len(data):
+        j = len(data)
+    batch = data[i: j]
+    index.upsert(vectors=batch)
+section 19
+# Run a filtered similarity search
+query = "amazing performance"
+results = index.query(queries=[query], top_k=100, filter={'sentiment': {'$eq': 'positive'}})
+print(results)
+section 20
+# Get the sentiment and review from id
+get_sentiment_and_review_from_id = {
+    x['id']: {
+        'sentiment': x['metadata']['sentiment'],
+        'review': x['full_review'],
+    } for x in data_local}
+section 21
+# Python function that retrieves reviews matching query and specific sentiment
+def review_and_sentiment(query, sentiment):
+    query_vector = vstore.query(query)
+    results = index.query(queries=[query_vector], top_k=100, filter={'sentiment': {'$eq': sentiment}})
+    ids = [i['id'] for i in results['results'][0]['matches']]
+    reviews = []
+    for id in ids:
+        reviews.append(get_sentiment_and_review_from_id[id])
+    return pd.DataFrame(reviews)
+section 22
+# Example usage of the review_and_sentiment function
+positive_reviews = review_and_sentiment('amazing movie', 'positive')
+negative_reviews = review_and_sentiment('disappointing', 'negative')
+
+
